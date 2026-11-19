@@ -19,7 +19,8 @@
 //!
 //! Supported keys: `image`, `build` (`dockerfile`, `context`, `args`),
 //! `mounts`, `forwardPorts`, `postCreateCommand`, plus `workspaceFolder`,
-//! `workspaceMount`, `containerEnv`, `remoteUser` and `runArgs`. Features and
+//! `workspaceMount`, `containerEnv`, `containerUser`, `remoteUser` and
+//! `runArgs`. Features and
 //! Compose are not.
 
 use anyhow::{Context, Result, bail};
@@ -185,7 +186,11 @@ pub struct DevContainer {
     pub workspace_folder: String,
     pub workspace_mount: String,
     pub env: Vec<(String, String)>,
+    /// The user attached sessions and commands run as (`docker exec -u`).
+    /// Defaults to the container's own user.
     pub remote_user: Option<String>,
+    /// The user the container's processes run as (`docker run -u`).
+    pub container_user: Option<String>,
     pub run_args: Vec<String>,
 }
 
@@ -364,6 +369,7 @@ pub fn parse(
             })
             .unwrap_or_default(),
         remote_user: str_of("remoteUser").map(str::to_string),
+        container_user: str_of("containerUser").map(str::to_string),
         run_args: v
             .get("runArgs")
             .and_then(Value::as_array)
@@ -452,6 +458,10 @@ pub fn run_args(dc: &DevContainer, root: &Path, id: &str, config_hash: &str) -> 
         "-w".into(),
         dc.workspace_folder.clone(),
     ];
+    if let Some(user) = &dc.container_user {
+        out.push("-u".into());
+        out.push(user.clone());
+    }
     for m in &dc.mounts {
         out.push("--mount".into());
         out.push(m.clone());
@@ -792,6 +802,28 @@ mod tests {
             "type=bind,source=/home/me/proj,target=/workspaces/proj"
         );
         assert_eq!(dc.remote_user.as_deref(), Some("vscode"));
+    }
+
+    #[test]
+    fn container_user_runs_the_container_and_remote_user_only_the_exec() {
+        let dc = parse_str(r#"{ "image": "x", "containerUser": "builder" }"#);
+        assert_eq!(dc.container_user.as_deref(), Some("builder"));
+        assert_eq!(dc.remote_user, None);
+        let run = run_args(&dc, Path::new("/w"), "id", "h");
+        let at = run.iter().position(|a| a == "-u").expect("run -u");
+        assert_eq!(run[at + 1], "builder");
+        // No `-u` on exec: it inherits the container's user.
+        assert!(!exec_args(&dc, "c", &["sh".to_string()], false).contains(&"-u".to_string()));
+
+        let dc = parse_str(r#"{ "image": "x", "containerUser": "a", "remoteUser": "b" }"#);
+        let exec = exec_args(&dc, "c", &["sh".to_string()], false);
+        assert_eq!(exec[exec.iter().position(|a| a == "-u").unwrap() + 1], "b");
+        // A changed containerUser needs a new container.
+        let other = parse_str(r#"{ "image": "x", "containerUser": "z", "remoteUser": "b" }"#);
+        assert_ne!(
+            config_hash(&dc, Path::new("/w"), "id"),
+            config_hash(&other, Path::new("/w"), "id")
+        );
     }
 
     #[test]
